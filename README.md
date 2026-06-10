@@ -20,9 +20,6 @@ FAERS contains millions of spontaneous adverse event reports. Raw signal is buri
 duplicate reports, inconsistent drug naming, off-label confounder effects. This pipeline applies
 the standard pharmacoepidemiological toolkit to surface real signals from that noise.
 
-Longer-term direction: cross-reference detected signals against pharmacogenomic biomarkers
-(PharmGKB, CPIC) to identify genotype-stratified AE risk — a gap in current surveillance practice.
-
 ## Repository structure
 
 ```
