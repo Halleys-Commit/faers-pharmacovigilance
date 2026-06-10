@@ -1,19 +1,29 @@
-# Raw data — never commit FAERS files
+# FAERS raw data — large files, never commit
 data/raw/
-data/*.zip
-data/*.txt
+data/master/
+data/figures/
+*.parquet
+
+# Signal output CSVs with actual data
+data/signals_*.csv
+
+# Zip downloads (transient)
+*.zip
 
 # Python
 __pycache__/
 *.pyc
 *.pyo
-.env
-venv/
-.venv/
-
-# Jupyter
 .ipynb_checkpoints/
-*.ipynb_checkpoints
+
+# Env
+venv/
+.env
 
 # OS
 .DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
