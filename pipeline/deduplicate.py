@@ -1,86 +1,131 @@
 """
-FAERS Report Deduplication
---------------------------
-Implements FDA-recommended deduplication logic for FAERS spontaneous reports.
+FAERS Case Deduplication
+-------------------------
+FDA FAERS contains duplicate and amended reports for the same adverse event.
+Each case gets a CASEID; follow-up amendments increment CASEVERSION.
 
-The Problem
------------
-The same adverse event is often reported multiple times:
-  - Manufacturer, consumer, and physician may all report the same case
-  - Follow-up reports update earlier initial reports (same CASEID, higher CASEVERSION)
-  - Duplicates inflate signal counts and bias disproportionality statistics
+FDA recommendation: keep only the highest CASEVERSION per CASEID.
+Additional heuristic: flag suspect duplicates across manufacturers
+(same patient demographics + event date + drug + AE from different reporters).
 
-FDA Guidance
-------------
-Per FDA's FAERS data guidance:
-  1. For cases with the same CASEID, keep only the record with the highest CASEVERSION
-  2. Apply further deduplication heuristics for suspected cross-quarter duplicates
-
-References
-----------
-Banda JM et al. (2016). A curated and standardized adverse drug event resource to
-accelerate drug safety research. Scientific Data. https://doi.org/10.1038/sdata.2016.26
+Usage:
+    from pipeline.deduplicate import deduplicate_cases
+    demo_deduped = deduplicate_cases(demo_df)
 """
+
+import logging
 
 import pandas as pd
 
+logger = logging.getLogger(__name__)
 
-def deduplicate_by_caseversion(demo_df: pd.DataFrame) -> pd.DataFrame:
+
+def deduplicate_cases(demo: pd.DataFrame) -> pd.DataFrame:
     """
-    For duplicate CASEIDs, retain only the most recent CASEVERSION.
+    Keep only the most recent version of each case.
 
-    This is the primary FDA-recommended deduplication step. A CASEID
-    represents a unique case; CASEVERSION tracks follow-up updates.
+    FDA standard method: for each CASEID, retain the row with the
+    highest numeric CASEVERSION. This removes superseded follow-up reports.
 
     Parameters
     ----------
-    demo_df : pd.DataFrame
-        Demographics table with 'caseid' and 'caseversion' columns
+    demo : pd.DataFrame
+        Raw DEMO table from FAERSParser.load_demo()
 
     Returns
     -------
     pd.DataFrame
-        Deduplicated DataFrame — one row per unique CASEID
+        One row per unique CASEID — latest version only.
+        Shape will be <= input shape.
     """
-    # TODO: implement — groupby caseid, keep max caseversion
-    raise NotImplementedError
+    before = len(demo)
+
+    # Coerce version to numeric for proper max() — some files have leading zeros
+    demo = demo.copy()
+    demo["_version_num"] = pd.to_numeric(demo.get("CASEVERSION", demo.get("CASEVERSION_N", 0)), errors="coerce").fillna(0)
+
+    # Keep highest version per case
+    key_col = "CASEID" if "CASEID" in demo.columns else "CASE_ID"
+    deduped = (
+        demo.sort_values("_version_num", ascending=False)
+            .drop_duplicates(subset=[key_col], keep="first")
+            .drop(columns=["_version_num"])
+            .reset_index(drop=True)
+    )
+
+    after = len(deduped)
+    logger.info(f"Deduplication: {before:,} rows → {after:,} unique cases ({before - after:,} follow-ups removed)")
+    return deduped
 
 
-def flag_duplicate_cases(demo_df: pd.DataFrame) -> pd.DataFrame:
+def flag_manufacturer_duplicates(
+    demo: pd.DataFrame,
+    drug: pd.DataFrame,
+    reac: pd.DataFrame,
+    age_tolerance: float = 2.0,
+) -> pd.DataFrame:
     """
-    Flag suspected duplicate cases using heuristic matching.
+    Heuristic cross-manufacturer duplicate detection.
 
-    Heuristics: same age + sex + event_dt + primary drug + primary AE
-    across different CASEIDs (cross-manufacturer duplicates).
+    Same adverse event reported by multiple sources (manufacturer + consumer)
+    creates distinct CASEIDs for the same real-world event. This flags
+    likely duplicates using a fingerprint of: age + sex + event date + drug + AE.
 
     Parameters
     ----------
-    demo_df : pd.DataFrame
-        Demographics table, post caseversion deduplication
+    demo : pd.DataFrame
+        Deduplicated DEMO table.
+    drug : pd.DataFrame
+        DRUG table filtered to primary suspect (ROLE_COD == 'PS').
+    reac : pd.DataFrame
+        REAC table.
+    age_tolerance : float
+        Age difference (years) within which two reports may be the same patient.
 
     Returns
     -------
     pd.DataFrame
-        Input DataFrame with added 'suspected_duplicate' boolean column
+        demo with added column `SUSPECT_DUPLICATE` (bool) and
+        `DUP_GROUP_ID` (shared int for suspected duplicate sets).
+
+    Notes
+    -----
+    This is a heuristic flag — do not drop these rows automatically.
+    Use for sensitivity analysis: run signal detection with and without
+    suspected duplicates to assess impact.
     """
-    # TODO: implement
-    raise NotImplementedError
+    demo = demo.copy()
+    demo["SUSPECT_DUPLICATE"] = False
+    demo["DUP_GROUP_ID"] = pd.NA
 
+    key_col = "CASEID" if "CASEID" in demo.columns else "CASE_ID"
 
-def apply_deduplication(faers_tables: dict) -> dict:
-    """
-    Full deduplication pipeline: caseversion + heuristic flagging.
+    # Build fingerprint: primary suspect drug + first reaction PT + age bucket + sex + event date
+    ps_drugs = drug[drug.get("ROLE_COD", pd.Series()) == "PS"].groupby("PRIMARYID")["DRUGNAME"].first().reset_index()
+    first_reac = reac.groupby("PRIMARYID")["PT"].first().reset_index()
 
-    Parameters
-    ----------
-    faers_tables : dict
-        Output from parse_faers.combine_quarters()
+    merged = demo.merge(ps_drugs, on="PRIMARYID", how="left")
+    merged = merged.merge(first_reac, on="PRIMARYID", how="left")
 
-    Returns
-    -------
-    dict
-        Same structure, deduplicated DEMO table, filtered ISRs propagated
-        to all other tables
-    """
-    # TODO: implement — filter all tables to retained ISRs after dedup
-    raise NotImplementedError
+    # Normalize drug name for matching (uppercase, strip spaces)
+    merged["_drug_norm"] = merged["DRUGNAME"].str.upper().str.strip() if "DRUGNAME" in merged else ""
+    merged["_pt_norm"] = merged["PT"].str.upper().str.strip() if "PT" in merged else ""
+    merged["_age_bucket"] = (pd.to_numeric(merged.get("AGE"), errors="coerce") // age_tolerance * age_tolerance)
+
+    fingerprint_cols = ["_drug_norm", "_pt_norm", "_age_bucket", "SEX", "EVENT_DT"]
+    available = [c for c in fingerprint_cols if c in merged.columns]
+
+    if len(available) < 3:
+        logger.warning("Insufficient columns for duplicate fingerprinting — skipping")
+        return demo
+
+    dup_groups = merged.groupby(available, dropna=False)[key_col].transform("count")
+    suspect_mask = dup_groups > 1
+
+    group_ids = merged.groupby(available, dropna=False).ngroup()
+    demo.loc[suspect_mask.values, "SUSPECT_DUPLICATE"] = True
+    demo.loc[suspect_mask.values, "DUP_GROUP_ID"] = group_ids[suspect_mask].values
+
+    n_flagged = suspect_mask.sum()
+    logger.info(f"Flagged {n_flagged:,} suspect cross-manufacturer duplicates ({n_flagged/len(demo)*100:.1f}%)")
+    return demo

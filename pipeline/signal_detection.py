@@ -1,166 +1,282 @@
 """
 Pharmacovigilance Signal Detection
 ------------------------------------
-Implements standard disproportionality analysis methods used by FDA, EMA,
-and WHO to detect drug-adverse event safety signals from spontaneous report data.
+Implements the three standard disproportionality analysis methods used by
+FDA, EMA, and industry for post-market safety signal detection from
+spontaneous adverse event reporting systems (FAERS, VAERS, EudraVigilance).
 
-Methods Implemented
--------------------
-ROR  — Reporting Odds Ratio (with 95% CI)
-PRR  — Proportional Reporting Ratio (with chi-square)
-EBGM — Empirical Bayes Geometric Mean (GPS/MGPS approximation)
+Methods implemented:
+    - ROR  : Reporting Odds Ratio  (EMA standard)
+    - PRR  : Proportional Reporting Ratio  (FDA / MHRA standard)
+    - EBGM : Empirical Bayes Geometric Mean  (FDA MGPS algorithm)
 
-Signal Threshold Conventions (literature standards)
-----------------------------------------------------
-ROR:   lower 95% CI > 1.0
-PRR:   PRR ≥ 2.0, chi-square ≥ 4.0, count ≥ 3
-EBGM:  EBGM05 (lower 95% CI) > 2.0
+Each method answers: "Is drug X reported with AE Y more than expected
+by chance, given everything else reported in the database?"
 
-Contingency Table
------------------
-For a given drug D and adverse event E:
-
-                  Event E    Not E
-    Drug D           a         b
-    Not Drug D       c         d
-
-All methods derive from variants of this 2×2 table.
-
-References
-----------
-Evans SJ et al. (2001). Use of proportional reporting ratios (PRRs) for signal
-generation from spontaneous adverse drug reaction reports. Pharmacoepidemiol Drug Saf.
-
-Bate A & Evans SJ (2009). Quantitative signal detection using spontaneous ADR reporting.
-Pharmacoepidemiol Drug Saf.
+Usage:
+    from pipeline.signal_detection import SignalDetector
+    detector = SignalDetector(drug_df, reac_df)
+    signals = detector.run_all(drug_name="WARFARIN", min_reports=3)
+    print(signals.sort_values("ROR", ascending=False).head(20))
 """
+
+import logging
+from typing import Optional
 
 import numpy as np
 import pandas as pd
 from scipy import stats
 
+logger = logging.getLogger(__name__)
 
-def build_contingency_table(
-    drug_ae_df: pd.DataFrame,
-    drug_col: str = "drugname_norm",
-    ae_col: str = "pt"
-) -> pd.DataFrame:
+
+class SignalDetector:
     """
-    Build the full drug × AE co-occurrence contingency matrix.
-
-    Each row = one drug-AE pair with counts a, b, c, d.
+    Compute disproportionality signals for a target drug against the full FAERS background.
 
     Parameters
     ----------
-    drug_ae_df : pd.DataFrame
-        Merged DRUG + REAC table (one row per drug-AE pair per case)
+    drug : pd.DataFrame
+        DRUG table (post-dedup). Must have PRIMARYID, DRUGNAME (or PROD_AI), ROLE_COD.
+    reac : pd.DataFrame
+        REAC table (post-dedup). Must have PRIMARYID, PT.
     drug_col : str
-        Column name for normalized drug names
-    ae_col : str
-        Column name for MedDRA PT terms
-
-    Returns
-    -------
-    pd.DataFrame
-        Columns: ['drug', 'ae', 'a', 'b', 'c', 'd', 'n_total']
+        Column to use for drug identification. Default 'PROD_AI' (active ingredient,
+        more consistent than DRUGNAME). Use 'DRUGNAME' if PROD_AI is sparse.
+    suspect_only : bool
+        If True (default), restrict to primary suspect drugs (ROLE_COD == 'PS').
+        Set False to include concomitant/secondary suspect — widens net but adds noise.
     """
-    # TODO: implement — efficient crosstab + margin calculations
-    raise NotImplementedError
 
+    def __init__(
+        self,
+        drug: pd.DataFrame,
+        reac: pd.DataFrame,
+        drug_col: str = "PROD_AI",
+        suspect_only: bool = True,
+    ):
+        self.drug_col = drug_col if drug_col in drug.columns else "DRUGNAME"
+        if suspect_only and "ROLE_COD" in drug.columns:
+            drug = drug[drug["ROLE_COD"] == "PS"]
 
-def compute_ror(contingency_df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Compute Reporting Odds Ratio with 95% confidence interval.
+        # Normalize drug names
+        drug = drug.copy()
+        drug["_drug"] = drug[self.drug_col].str.upper().str.strip()
+        reac = reac.copy()
+        reac["_pt"] = reac["PT"].str.upper().str.strip()
 
-    ROR = (a/b) / (c/d) = (a*d) / (b*c)
+        # Core co-occurrence table: one row per (case, drug, PT) combination
+        self._pairs = drug[["PRIMARYID", "_drug"]].merge(
+            reac[["PRIMARYID", "_pt"]], on="PRIMARYID", how="inner"
+        )
+        self._N = self._pairs["PRIMARYID"].nunique()  # total cases in database
+        logger.info(f"SignalDetector initialized: {self._N:,} cases, {len(self._pairs):,} drug-AE pairs")
 
-    CI: exp(log(ROR) ± 1.96 * SE)
-    SE = sqrt(1/a + 1/b + 1/c + 1/d)
+    def _contingency(self, drug_name: str, pt_term: str) -> tuple[int, int, int, int]:
+        """
+        Build 2x2 contingency table for one drug-AE pair.
 
-    Signal threshold: ROR_lower_CI > 1.0
+        Returns (a, b, c, d) where:
+            a = reports with drug AND AE       (target cell)
+            b = reports with drug, WITHOUT AE
+            c = reports WITHOUT drug, WITH AE
+            d = reports without drug AND without AE
+        """
+        drug_cases = set(self._pairs[self._pairs["_drug"] == drug_name]["PRIMARYID"])
+        ae_cases   = set(self._pairs[self._pairs["_pt"]   == pt_term   ]["PRIMARYID"])
 
-    Parameters
-    ----------
-    contingency_df : pd.DataFrame
-        Output of build_contingency_table()
+        a = len(drug_cases & ae_cases)
+        b = len(drug_cases) - a
+        c = len(ae_cases)   - a
+        d = self._N - a - b - c
+        return a, b, c, d
 
-    Returns
-    -------
-    pd.DataFrame
-        Input DataFrame with added columns: ['ror', 'ror_lower', 'ror_upper']
-    """
-    # TODO: implement — handle zeros with 0.5 continuity correction
-    raise NotImplementedError
+    def _build_counts_table(self, drug_name: str) -> pd.DataFrame:
+        """
+        Compute contingency counts for ALL AEs reported with a given drug.
+        Vectorized — much faster than calling _contingency() in a loop.
+        """
+        drug_cases = set(self._pairs[self._pairs["_drug"] == drug_name]["PRIMARYID"])
+        n_drug = len(drug_cases)
 
+        if n_drug == 0:
+            logger.warning(f"Drug '{drug_name}' not found. Check spelling/normalization.")
+            return pd.DataFrame()
 
-def compute_prr(contingency_df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Compute Proportional Reporting Ratio with chi-square statistic.
+        # All AEs co-reported with this drug
+        drug_reac = self._pairs[self._pairs["_drug"] == drug_name].groupby("_pt")["PRIMARYID"].nunique().rename("a")
 
-    PRR = [a / (a+b)] / [c / (c+d)]
+        # All AEs in full database
+        all_reac = self._pairs.groupby("_pt")["PRIMARYID"].nunique().rename("ae_total")
 
-    Signal threshold: PRR ≥ 2.0 AND chi2 ≥ 4.0 AND a ≥ 3
+        counts = drug_reac.reset_index().merge(all_reac.reset_index(), on="_pt")
+        counts["b"] = n_drug - counts["a"]           # drug, no AE
+        counts["c"] = counts["ae_total"] - counts["a"]  # AE, no drug
+        counts["d"] = self._N - n_drug - counts["c"]    # neither
+        counts["n_drug_total"] = n_drug
+        counts["N"] = self._N
+        return counts.rename(columns={"_pt": "PT"})
 
-    Parameters
-    ----------
-    contingency_df : pd.DataFrame
-        Output of build_contingency_table()
+    # ── Signal methods ─────────────────────────────────────────────────────────
 
-    Returns
-    -------
-    pd.DataFrame
-        Input with added columns: ['prr', 'prr_lower', 'prr_upper', 'chi2', 'p_value']
-    """
-    # TODO: implement
-    raise NotImplementedError
+    def ror(self, counts: pd.DataFrame) -> pd.DataFrame:
+        """
+        Reporting Odds Ratio (ROR) with 95% CI.
 
+        ROR = (a/b) / (c/d) = (a*d) / (b*c)
+        Signal threshold: ROR lower 95% CI > 1.0
 
-def compute_ebgm(contingency_df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Compute EBGM (Empirical Bayes Geometric Mean) — GPS approximation.
+        EMA standard method. Analogous to case-control OR.
+        Tends to inflate for drugs with many reports (Rawlins bias).
+        """
+        df = counts.copy()
+        df["ROR"] = (df["a"] * df["d"]) / (df["b"] * df["c"])
 
-    EBGM shrinks noisy high-ROR estimates toward the prior for sparse cells.
-    Particularly useful for drug-AE pairs with small counts (a < 10).
+        # Log-scale CI via delta method
+        df["_se_log"] = np.sqrt(1/df["a"] + 1/df["b"] + 1/df["c"] + 1/df["d"])
+        df["ROR_CI_lo"] = np.exp(np.log(df["ROR"]) - 1.96 * df["_se_log"])
+        df["ROR_CI_hi"] = np.exp(np.log(df["ROR"]) + 1.96 * df["_se_log"])
+        df["ROR_signal"] = df["ROR_CI_lo"] > 1.0
 
-    This implements a simplified single-term prior — for full MGPS
-    (Multi-item Gamma-Poisson Shrinker) see: DuMouchel (1999).
+        return df.drop(columns=["_se_log"])
 
-    Parameters
-    ----------
-    contingency_df : pd.DataFrame
-        Output of build_contingency_table()
+    def prr(self, counts: pd.DataFrame) -> pd.DataFrame:
+        """
+        Proportional Reporting Ratio (PRR) with 95% CI and chi-squared.
 
-    Returns
-    -------
-    pd.DataFrame
-        Input with added columns: ['ebgm', 'eb05', 'eb95']
-        eb05 = lower 5th percentile (primary signal threshold: eb05 > 2.0)
-    """
-    # TODO: implement DuMouchel single-term prior approximation
-    raise NotImplementedError
+        PRR = [a/(a+b)] / [c/(c+d)]
+        Signal threshold (MHRA): PRR >= 2, chi2 >= 4, a >= 3
 
+        FDA/MHRA standard. Easier to interpret than ROR but more sensitive
+        to common drugs (many background reports of the same AE).
+        """
+        df = counts.copy()
+        df["PRR"] = (df["a"] / (df["a"] + df["b"])) / (df["c"] / (df["c"] + df["d"]))
 
-def flag_signals(
-    results_df: pd.DataFrame,
-    method: str = "ror",
-    min_count: int = 3
-) -> pd.DataFrame:
-    """
-    Apply signal threshold criteria to disproportionality results.
+        df["_se_log"] = np.sqrt(1/df["a"] - 1/(df["a"]+df["b"]) + 1/df["c"] - 1/(df["c"]+df["d"]))
+        df["PRR_CI_lo"] = np.exp(np.log(df["PRR"]) - 1.96 * df["_se_log"])
+        df["PRR_CI_hi"] = np.exp(np.log(df["PRR"]) + 1.96 * df["_se_log"])
 
-    Parameters
-    ----------
-    results_df : pd.DataFrame
-        Output of compute_ror(), compute_prr(), or compute_ebgm()
-    method : str
-        One of 'ror', 'prr', 'ebgm'
-    min_count : int
-        Minimum case count (a) to flag — avoids noise from single reports
+        # Chi-squared test (Pearson)
+        def chi2_p(row):
+            table = [[row["a"], row["b"]], [row["c"], row["d"]]]
+            try:
+                chi2, p, _, _ = stats.chi2_contingency(table, correction=False)
+                return chi2, p
+            except Exception:
+                return np.nan, np.nan
 
-    Returns
-    -------
-    pd.DataFrame
-        Filtered and sorted DataFrame of flagged signals
-    """
-    # TODO: implement per-method thresholding
-    raise NotImplementedError
+        chi_results = df.apply(chi2_p, axis=1, result_type="expand")
+        df["PRR_chi2"] = chi_results[0]
+        df["PRR_p"] = chi_results[1]
+
+        # MHRA signal criteria
+        df["PRR_signal"] = (df["PRR"] >= 2) & (df["PRR_chi2"] >= 4) & (df["a"] >= 3)
+
+        return df.drop(columns=["_se_log"])
+
+    def ebgm(self, counts: pd.DataFrame) -> pd.DataFrame:
+        """
+        Empirical Bayes Geometric Mean (EBGM) — simplified single-term approximation.
+
+        EBGM shrinks extreme ROR estimates toward the prior (database average),
+        stabilizing signals from drug-AE pairs with few reports.
+
+        Full FDA MGPS uses a two-term mixture prior (DuMouchel 1999). This
+        implementation uses the simplified single-prior version sufficient for
+        exploratory analysis. For production use, implement DuMouchel's EM algorithm.
+
+        Signal threshold: EB05 (5th percentile of EB posterior) > 2.0
+
+        Reference: DuMouchel W (1999). Bayesian Data Mining in Large Frequency Tables.
+        The American Statistician, 53(2), 177–190.
+        """
+        df = counts.copy()
+
+        # Expected count under independence
+        df["E"] = (df["a"] + df["b"]) * (df["a"] + df["c"]) / df["N"]
+        df["E"] = df["E"].clip(lower=1e-6)
+
+        # Observed/expected ratio (raw, = simplified EBGM without shrinkage)
+        df["IC"] = np.log2((df["a"] + 0.5) / (df["E"] + 0.5))  # Information Component (IC, WHO-UMC)
+
+        # Simplified EBGM: shrink toward prior mean = 1 using pseudo-count alpha=0.5
+        # Full DuMouchel MGPS requires fitting mixture prior via EM — implement separately
+        alpha = 0.5
+        df["EBGM"] = (df["a"] + alpha) / (df["E"] + alpha)
+
+        # Approximate 90% CI via Poisson gamma (simplified)
+        df["EB05"] = np.exp(
+            np.log(df["EBGM"]) - 1.645 * np.sqrt(1 / (df["a"] + alpha))
+        )
+        df["EB95"] = np.exp(
+            np.log(df["EBGM"]) + 1.645 * np.sqrt(1 / (df["a"] + alpha))
+        )
+        df["EBGM_signal"] = df["EB05"] > 2.0
+
+        return df
+
+    # ── Main interface ─────────────────────────────────────────────────────────
+
+    def run_all(
+        self,
+        drug_name: str,
+        min_reports: int = 3,
+        signal_any: bool = True,
+    ) -> pd.DataFrame:
+        """
+        Run ROR + PRR + EBGM for all AEs co-reported with drug_name.
+
+        Parameters
+        ----------
+        drug_name : str
+            Drug name as it appears in PROD_AI or DRUGNAME (uppercase).
+            Partial matching not supported — normalize first if needed.
+        min_reports : int
+            Minimum co-reports (a >= min_reports) to include in output.
+            FDA convention: exclude pairs with < 3 reports.
+        signal_any : bool
+            If True, filter output to rows where at least one method flags a signal.
+            Set False to return full table.
+
+        Returns
+        -------
+        pd.DataFrame
+            One row per AE, columns: PT, a, ROR, ROR_CI_lo, ROR_CI_hi, ROR_signal,
+            PRR, PRR_chi2, PRR_signal, EBGM, EB05, EBGM_signal, SIGNAL_COUNT
+        """
+        drug_name = drug_name.upper().strip()
+        counts = self._build_counts_table(drug_name)
+        if counts.empty:
+            return pd.DataFrame()
+
+        counts = counts[counts["a"] >= min_reports]
+        if counts.empty:
+            logger.warning(f"No AEs with >= {min_reports} reports for '{drug_name}'")
+            return pd.DataFrame()
+
+        # Apply all three methods
+        result = self.ror(counts)
+        result = self.prr(result)
+        result = self.ebgm(result)
+
+        # Summary signal count (0–3)
+        result["SIGNAL_COUNT"] = (
+            result["ROR_signal"].astype(int) +
+            result["PRR_signal"].astype(int) +
+            result["EBGM_signal"].astype(int)
+        )
+
+        if signal_any:
+            result = result[result["SIGNAL_COUNT"] > 0]
+
+        keep_cols = [
+            "PT", "a", "N",
+            "ROR", "ROR_CI_lo", "ROR_CI_hi", "ROR_signal",
+            "PRR", "PRR_chi2", "PRR_p", "PRR_signal",
+            "EBGM", "EB05", "EB95", "IC", "EBGM_signal",
+            "SIGNAL_COUNT",
+        ]
+        keep_cols = [c for c in keep_cols if c in result.columns]
+
+        return result[keep_cols].sort_values("SIGNAL_COUNT", ascending=False).reset_index(drop=True)
