@@ -7,8 +7,9 @@ data/figures/
 # Signal output CSVs with actual data
 data/signals_*.csv
 
-# Zip downloads (transient)
+# Zip downloads and logs (transient)
 *.zip
+*.log
 
 # Python
 __pycache__/
@@ -27,3 +28,7 @@ Thumbs.db
 # IDE
 .vscode/
 .idea/
+
+# Claude tooling — never commit
+CLAUDE.md
+.claude/
